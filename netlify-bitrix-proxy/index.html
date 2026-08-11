@@ -1250,7 +1250,22 @@ function exportCsv(){
 }
 
 /* ═════════ RENDER ═════════ */
+function aplicarRestricoesDeAcesso(){
+  try{
+    const s=JSON.parse(sessionStorage.getItem("cp_session")||"null");
+    const btnP=el("btnPersonalizado"), lp=el("logPanel");
+    if(s && s.tipo==="individual"){
+      if(btnP) btnP.style.display="none";
+      if(lp) lp.style.display="none";
+      if(period==="custom") period=7;
+    }else{
+      if(btnP) btnP.style.display="";
+      if(lp) lp.style.display="";
+    }
+  }catch(e){}
+}
 function render(){
+  aplicarRestricoesDeAcesso();
   const all=prepare();
   fillEntitySelect(all);
   const filtered=applyFilters(all);
@@ -1425,12 +1440,6 @@ try{
     el("btnPerms").addEventListener("click",togglePerms);
     el("permsSearch").addEventListener("input",debounce(()=>{ permsQuery=el("permsSearch").value; renderPermsFiltrado(); },150));
   }
-  if(s && s.tipo==="individual"){
-    // Acesso Básico: sem período personalizado e sem o registro detalhado
-    // de tarefas — só os indicadores e a navegação por setor/colaborador.
-    el("btnPersonalizado").style.display="none";
-    el("logPanel").style.display="none";
-  }
 }catch(e){}
 
 /* ═════════ PAINEL DE PERMISSÕES (admin) ═════════
@@ -1522,10 +1531,6 @@ function renderPermsFiltrado(){
 }
 
 loadPrefs();
-try{
-  const s=JSON.parse(sessionStorage.getItem("cp_session")||"null");
-  if(s && s.tipo==="individual" && period==="custom") period=7;
-}catch(e){}
 boot();
 setInterval(boot,5*60*1000);
 </script>
