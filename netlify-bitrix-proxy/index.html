@@ -382,10 +382,14 @@ const BITRIX_URL="https://gcm.bitrix24.com.br/rest/935/7ie7vmhsgev5e32p/";
 const BITRIX_PROXY_URL="https://testecentral.netlify.app/.netlify/functions/bitrix-proxy";
 const DONE_STATUS="respondido";
 const PENDING_STATUS="pendente";
-/* status considerados no painel: respondido (avaliação recebida) e
+const WAITING_STATUS="aguardando_justificativa";
+/* status considerados no painel: respondido (avaliação recebida),
    pendente (avaliação ainda não respondida — tratada como "Não avaliada"
-   e contada junto com as satisfeitas, ver prepare()) */
-const INCLUDED_STATUSES=[DONE_STATUS,PENDING_STATUS];
+   e contada junto com as satisfeitas, ver prepare()) e
+   aguardando_justificativa (a nota já veio, só falta o motivo — conta com
+   a nota dada; sem isso, um Insatisfeito sumia do painel até o avaliador
+   escrever a justificativa) */
+const INCLUDED_STATUSES=[DONE_STATUS,PENDING_STATUS,WAITING_STATUS];
 /* só as colunas usadas — evita trafegar a tabela inteira */
 const COLUMNS=["id","id_tarefa","tarefa","proprietario_nome","responsavel_nome","nome_respondente",
                "status","avaliacao","justificativa","data_envio","data_resposta"].join(",");
@@ -534,8 +538,11 @@ async function fetchTaskMeta(ids){
             matchWorkTime:t.matchWorkTime??t.MATCH_WORK_TIME,
             responsibleId:String(t.responsibleId??t.RESPONSIBLE_ID??"")};
         });
+        /* só marca como consultado se o lote deu certo — um lote que falhou
+           é tentado de novo na próxima atualização, em vez de as tarefas
+           ficarem sem dados do Bitrix até alguém recarregar a página */
+        chunk.forEach(id=>metaFetched.add(id));
       }catch(e){ console.warn("tasks.task.list lote falhou:",e); }
-      chunk.forEach(id=>metaFetched.add(id));
     }));
   }
   return out;
@@ -593,62 +600,64 @@ function findUser(name){
   const c=IDX_FIRST[t[0]];
   return (c&&c.length===1)?c[0]:null;
 }
-/* IDENTIDADE POR NOME: "nome igual = mesmo departamento", ponto final.
-   Em vez de tentar casar IDs numéricos do Bitrix (frágil — sofre com
-   string vs número, e com departamentos duplicados de propósito no
-   organograma), cada departamento é identificado pelo seu NOME
-   normalizado. Isso funde automaticamente qualquer duplicidade e nunca
-   sofre o tipo de bug "ID 25 !== ID 25" (comparação de tipos diferentes). */
+/* IDENTIDADE POR ID: cada setor é o departamento do Bitrix pelo seu ID.
+   Setores com o mesmo nome em pontos diferentes do organograma ficam
+   separados, cada um com os seus números. Todo ID passa por String() na
+   entrada (chaves de DEPTS, PARENT e UF_DEPARTMENT), então a comparação é
+   sempre texto com texto — sem o problema de "25" (texto) ≠ 25 (número). */
 const SENTINEL_NAMES={__off__:"Organograma indisponível",__nf__:"Não localizado no Bitrix",__nd__:"Sem departamento"};
-let NAME_KEY_DISPLAY={};
-function buildNameKeyDisplay(){
-  NAME_KEY_DISPLAY={};
-  // ordena por ID pra sempre escolher a MESMA grafia como "oficial" entre duplicatas
-  const sorted=Object.values(DEPTS).sort((a,b)=>Number(a.ID)-Number(b.ID));
-  sorted.forEach(d=>{
-    const k="n:"+norm(d.NAME);
-    if(!NAME_KEY_DISPLAY[k]) NAME_KEY_DISPLAY[k]=d.NAME;
+let DEPT_LABEL={};
+/* Rótulo completo de cada setor. Nome único → só o nome. Nome repetido →
+   nome + setor-pai ("Vendas · Loja Centro"); se ainda assim empatar, entra o
+   ID no fim. É o rótulo do filtro, dos chips, da tabela e do CSV. */
+function buildDeptLabels(){
+  DEPT_LABEL={};
+  const porNome={};
+  Object.values(DEPTS).forEach(d=>{ const k=norm(d.NAME); (porNome[k]=porNome[k]||[]).push(d); });
+  Object.values(porNome).forEach(grupo=>{
+    if(grupo.length===1){ DEPT_LABEL[String(grupo[0].ID)]=grupo[0].NAME; return; }
+    const comPai=grupo.map(d=>{
+      const pai=d.PARENT?DEPTS[String(d.PARENT)]:null;
+      return {id:String(d.ID), label:pai?`${d.NAME} · ${pai.NAME}`:d.NAME};
+    });
+    const vezes={};
+    comPai.forEach(x=>{ const k=norm(x.label); vezes[k]=(vezes[k]||0)+1; });
+    comPai.forEach(x=>{ DEPT_LABEL[x.id]=vezes[norm(x.label)]>1?`${x.label} (#${x.id})`:x.label; });
   });
 }
-function deptNameKey(realId){
-  const d=DEPTS[String(realId)];
-  return d ? "n:"+norm(d.NAME) : String(realId);
-}
-function deptLabel(key){ return NAME_KEY_DISPLAY[key] || SENTINEL_NAMES[key] || key; }
-/* Cadeia de departamentos da folha até a raiz, já convertida pra chaves de
-   nome (uma por nível). Recebe o ID REAL do Bitrix (pra poder percorrer os
-   PARENTs de verdade); devolve chaves de nome, imunes a duplicidade de ID. */
-function deptChainIds(realId){
-  realId=String(realId);
-  if(!DEPTS[realId]) return [realId]; // sentinela — sem hierarquia real
-  const chain=[]; let cur=DEPTS[realId], curId=realId, g=0;
+/* Nome curto — onde o caminho já dá o contexto (breadcrumb e cartões). */
+function deptName(id){ const d=DEPTS[String(id)]; return d?d.NAME:(SENTINEL_NAMES[id]||String(id)); }
+function deptLabel(id){ return DEPT_LABEL[String(id)]||SENTINEL_NAMES[id]||String(id); }
+/* Cadeia de IDs do setor até a raiz (o próprio setor primeiro). */
+function deptChainIds(id){
+  id=String(id);
+  if(!DEPTS[id]) return [id]; // sentinela — sem hierarquia real
+  const chain=[]; let cur=DEPTS[id], curId=id, g=0;
   while(true){
-    chain.push(deptNameKey(curId));
+    chain.push(curId);
     const parentId=cur.PARENT?String(cur.PARENT):null;
     if(!parentId||!DEPTS[parentId]||g++>25) break;
     curId=parentId; cur=DEPTS[curId];
   }
   return chain;
 }
-/* Retorna o departamento IMEDIATO da pessoa (folha da árvore), já como
-   chave de nome — a navegação por hierarquia sobe/desce os níveis por cima
-   dessas chaves, nunca por ID bruto. */
+/* Departamento IMEDIATO da pessoa (folha da árvore), pelo ID do Bitrix. */
 function sectorOf(u){
-  if(!bitrixOK) return {id:"__off__",name:"Organograma indisponível",realId:null};
-  if(!u) return {id:"__nf__",name:"Não localizado no Bitrix",realId:null};
-  const rawIds=(u.UF_DEPARTMENT||[]).map(String);
-  const realId=rawIds.find(id=>DEPTS[id]);
-  if(!realId) return {id:"__nd__",name:"Sem departamento",realId:null};
-  return {id:deptNameKey(realId), name:DEPTS[realId].NAME, realId};
+  if(!bitrixOK) return {id:"__off__",name:SENTINEL_NAMES.__off__};
+  if(!u) return {id:"__nf__",name:SENTINEL_NAMES.__nf__};
+  const id=(u.UF_DEPARTMENT||[]).map(String).find(x=>DEPTS[x]);
+  if(!id) return {id:"__nd__",name:SENTINEL_NAMES.__nd__};
+  return {id, name:deptLabel(id)};
 }
 
 /* ═════════ PRAZO ═════════
    Classificação pelo % do tempo total (criação → prazo) já consumido até a
-   conclusão (data_envio):
+   conclusão (data de conclusão da tarefa no Bitrix):
      ≤30%        → Rápida
      31% a 90%   → Normal
      91% a 100%  → No prazo
-     >100%       → Atrasada */
+     >100%       → Atrasada
+   Tarefa sem prazo no Bitrix conta como No prazo (ver prepare()). */
 function classifySLA(created,deadline,done){
   if(!created||!deadline||!done) return null;
   const total=deadline-created;
@@ -679,18 +688,29 @@ function prepare(){
     const nomeResp = u ? `${u.NAME} ${u.LAST_NAME}`.trim() : cleanName(r.responsavel_nome);
     const rated=r.avaliacao!=null&&r.avaliacao!=="";
     const dEnv=toDate(r.data_envio),dRes=toDate(r.data_resposta);
+    /* Conclusão = data de conclusão da tarefa no Bitrix (CLOSED_DATE). Se a
+       tarefa não tiver essa data (reaberta, excluída, sem acesso ou Bitrix
+       fora do ar), usa a data de envio da avaliação como reserva. */
+    const fechadaBitrix=meta?toDate(meta.closedDate):null;
+    const conclusao=fechadaBitrix||dEnv;
     const created=meta?toDate(meta.createdDate):null;
     const deadline=meta?toDate(meta.deadline):null;
-    const slaResult=deadline?classifySLA(created||dEnv,deadline,dEnv):null;
+    /* Sem prazo = tarefa consultada no Bitrix e sem DEADLINE → conta como
+       No prazo. Se não deu para consultar a tarefa (sem meta), não há como
+       saber se ela tinha prazo, então fica fora do indicador. */
+    const semPrazo=!!meta&&!deadline;
+    const slaResult=semPrazo?{status:"no_prazo",pct:null}
+      :deadline?classifySLA(created||conclusao,deadline,conclusao):null;
     return {
       idTarefa:r.id_tarefa, tarefa:r.tarefa,
       criador:r.proprietario_nome, responsavel:nomeResp, respondente:r.nome_respondente,
-      justificativa:r.justificativa,
-      setorId:s.id, setorNome:s.name, deptChain:s.realId?deptChainIds(s.realId):[s.id], cargo:u?(u.WORK_POSITION||""):"", achado:!!u, achadoViaId:viaId,
+      justificativa:r.justificativa, aguardandoJust:norm(r.status)===WAITING_STATUS,
+      setorId:s.id, setorNome:s.name, deptChain:deptChainIds(s.id), cargo:u?(u.WORK_POSITION||""):"", achado:!!u, achadoViaId:viaId,
       rated, sat: rated?Number(r.avaliacao)===1:true,
-      conclusao:dEnv, dataResposta:dRes, deadline, criado:created,
-      execMs:(created&&dEnv)?(dEnv-created):null,   /* duração real do trabalho */
-      avalMs:(dEnv&&dRes)?(dRes-dEnv):null,          /* latência da avaliação */
+      conclusao, conclusaoBitrix:!!fechadaBitrix, dataEnvio:dEnv, dataResposta:dRes, deadline, criado:created,
+      execMs:(created&&conclusao)?(conclusao-created):null,   /* duração real do trabalho */
+      avalMs:(dEnv&&dRes)?(dRes-dEnv):null,                   /* latência da avaliação */
+      semPrazo,
       sla: slaResult?slaResult.status:null,
       slaPct: slaResult?slaResult.pct:null
     };
@@ -714,7 +734,8 @@ function stats(list){
     normais:cs.filter(t=>t.sla==="normal").length,
     noPrazo:cs.filter(t=>t.sla==="no_prazo").length,
     atrasadas,
-    noPrazoPct: cs.length?((cs.length-atrasadas)/cs.length)*100:null
+    noPrazoPct: cs.length?((cs.length-atrasadas)/cs.length)*100:null,
+    semPrazo:list.filter(t=>t.semPrazo).length
   };
 }
 
@@ -749,7 +770,7 @@ function matchesOtherFilters(t,f){
   if(f.rating==="unrated"&&t.rated) return false;
   if(f.rating==="sat"&&!t.sat) return false;
   if(f.rating==="unsat"&&t.sat) return false;
-  if(f.sla==="sem"&&t.sla) return false;
+  if(f.sla==="sem"&&!t.semPrazo) return false;
   if(f.sla&&f.sla!=="sem"&&t.sla!==f.sla) return false;
   if(f.q&&!(norm(t.tarefa).includes(f.q)||String(t.idTarefa||"").includes(f.q))) return false;
   return true;
@@ -791,18 +812,19 @@ function sparkline(list){
     <polyline points="${pts}" fill="none" stroke="#003E73" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
 }
 function renderKPIs(cur,prev){
-  const c=stats(cur),p=stats(prev), semPrazo=cur.length-c.slaN;
-  const slaFormula="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada.";
+  const c=stats(cur),p=stats(prev), semDados=cur.length-c.slaN;
+  const slaFormula="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Tarefas sem prazo no Bitrix contam como No prazo.";
   const cards=[
     {k:"Concluídas",v:nf.format(c.n),spark:sparkline(cur),
      foot:trendChip(c.n,period?p.n:null,true,d=>nf.format(Math.round(d))+" tarefas")},
     {k:"Entregas no prazo",v:c.noPrazoPct==null?"—":Math.round(c.noPrazoPct)+"%",
      foot:trendChip(c.noPrazoPct,period?p.noPrazoPct:null,true,d=>d.toFixed(1)+" p.p.")
           +`<span class="note hastip" data-tip="${esc(slaFormula)}">${c.rapidas} rápida(s) · ${c.normais} normal(is) · ${c.noPrazo} no prazo · ${c.atrasadas} atrasada(s)</span>`
-          +(semPrazo?`<span class="note warn" data-tip="Estas tarefas não têm prazo (DEADLINE) cadastrado no Bitrix, então ficam fora deste indicador.">⚠ ${nf.format(semPrazo)} sem prazo</span>`:"")},
+          +(c.semPrazo?`<span class="note hastip" data-tip="Tarefas sem prazo cadastrado no Bitrix. Entram neste indicador como No prazo.">${nf.format(c.semPrazo)} sem prazo, contadas no prazo</span>`:"")
+          +(semDados?`<span class="note warn" data-tip="Não foi possível consultar estas tarefas no Bitrix (excluídas, sem acesso ou falha na consulta), então ficam fora deste indicador.">⚠ ${nf.format(semDados)} sem dados do Bitrix</span>`:"")},
     {k:"Tempo médio de execução",v:fmtDur(c.avgExec),
      foot:trendChip(c.avgExec,period?p.avgExec:null,false,d=>fmtDur(d))
-          +`<span class="note" data-tip="Da criação da tarefa no Bitrix até a conclusão (data de envio).">criação → conclusão</span>`},
+          +`<span class="note" data-tip="Da criação até a conclusão da tarefa no Bitrix.">criação → conclusão</span>`},
     {k:"Avaliadas",v:c.ratedPct==null?"—":Math.round(c.ratedPct)+"%",
      foot:trendChip(c.ratedPct,period?p.ratedPct:null,true,d=>d.toFixed(1)+" p.p.")
           +`<span class="note hastip" data-tip="Tarefas em que o solicitante realmente respondeu a avaliação (Satisfeito/Insatisfeito). As demais ficam sem nota e são presumidas satisfeitas.">${nf.format(c.rated)} de ${nf.format(c.n)} responderam</span>`},
@@ -997,7 +1019,7 @@ function renderColabList(list){
       <div class="nm" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600">${esc(grp.label)}${fora?` <span class="flag">fora do organograma</span>`:""}</div>
       <div class="colab-mini">${s.n} tarefa(s)</div>
       <div class="colab-mini">${fmtDur(s.avgExec)}</div>
-      <div class="colab-mini hastip" style="color:${pc}" data-tip="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Este indicador conta tudo que NÃO é Atrasada.">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"} no prazo</div>
+      <div class="colab-mini hastip" style="color:${pc}" data-tip="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Este indicador conta tudo que NÃO é Atrasada. Tarefas sem prazo no Bitrix contam como No prazo.">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"} no prazo</div>
       <div class="colab-mini" style="font-weight:700">${s.satPct==null?"—":Math.round(s.satPct)+"%"} satisf.</div>
     </div>`;
   }).join("");
@@ -1027,7 +1049,7 @@ function renderBreadcrumb(){
   if(!bar) return;
   const chain = activeEntity==null ? [] : [...deptChainIds(activeEntity)].reverse();
   const crumbs = [`<button data-id="" class="crumb">Setores</button>`]
-    .concat(chain.map(id=>`<button data-id="${esc(id)}" class="crumb">${esc(deptLabel(id))}</button>`));
+    .concat(chain.map(id=>`<button data-id="${esc(id)}" class="crumb">${esc(deptName(id))}</button>`));
   bar.innerHTML = crumbs.join(`<span class="sep">›</span>`);
   bar.querySelectorAll(".crumb").forEach(b=>b.addEventListener("click",()=>{
     activeEntity = b.dataset.id || null;
@@ -1037,17 +1059,22 @@ function renderBreadcrumb(){
   }));
 }
 function renderSectorHierarchy(list){
-  el("gridTitle").textContent = activeEntity ? deptLabel(activeEntity) : "Setores";
+  el("gridTitle").textContent = activeEntity ? deptName(activeEntity) : "Setores";
   renderBreadcrumb();
 
   const groups=new Map(); const directItems=[];
   list.forEach(t=>{
     const child=childOfInChain(t.deptChain, activeEntity);
     if(child==null){ directItems.push(t); return; }
-    if(!groups.has(child)) groups.set(child,{label:deptLabel(child),items:[]});
+    if(!groups.has(child)) groups.set(child,{label:deptName(child),nome:deptName(child),items:[]});
     groups.get(child).items.push(t);
   });
   const rows=[...groups.entries()].sort((a,b)=>b[1].items.length-a[1].items.length);
+  /* no mesmo nível, dois setores com o mesmo nome mostram o rótulo completo
+     (com o setor-pai) para dar pra diferenciar os cartões */
+  const repetidos={};
+  rows.forEach(([,grp])=>{ const k=norm(grp.label); repetidos[k]=(repetidos[k]||0)+1; });
+  rows.forEach(([key,grp])=>{ if(repetidos[norm(grp.label)]>1) grp.label=deptLabel(key); });
   const box=el("grid");
 
   if(!rows.length){
@@ -1072,7 +1099,7 @@ function renderSectorHierarchy(list){
     const pc=s.noPrazoPct==null?"#9AA0B4":s.noPrazoPct>=85?"#00973A":s.noPrazoPct>=60?"#BA560B":"#DE001A";
     return `<div class="entity" data-key="${esc(key)}" tabindex="0" role="button">
       <div class="entity-hd">
-        <div class="avatar">${esc(initials(grp.label))}</div>
+        <div class="avatar">${esc(initials(grp.nome||grp.label))}</div>
         <div style="min-width:0;flex:1">
           <div class="nm">${esc(grp.label)}</div>
           <div class="sub">${s.n} tarefa(s) concluída(s)</div>
@@ -1082,7 +1109,7 @@ function renderSectorHierarchy(list){
       <div class="mgrid">
         <div><div class="k">Quantidade</div><div class="v">${nf.format(s.n)}</div></div>
         <div><div class="k">Tempo</div><div class="v">${fmtDur(s.avgExec)}</div></div>
-        <div><div class="k hastip" data-tip="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Este indicador conta tudo que NÃO é Atrasada.">No prazo</div><div class="v" style="color:${pc}">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"}</div></div>
+        <div><div class="k hastip" data-tip="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Este indicador conta tudo que NÃO é Atrasada. Tarefas sem prazo no Bitrix contam como No prazo.">No prazo</div><div class="v" style="color:${pc}">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"}</div></div>
       </div></div>`;
   }).join("");
 
@@ -1100,7 +1127,7 @@ function renderSectorHierarchy(list){
       <div class="mgrid">
         <div><div class="k">Quantidade</div><div class="v">${nf.format(s.n)}</div></div>
         <div><div class="k">Tempo</div><div class="v">${fmtDur(s.avgExec)}</div></div>
-        <div><div class="k hastip" data-tip="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Este indicador conta tudo que NÃO é Atrasada.">No prazo</div><div class="v">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"}</div></div>
+        <div><div class="k hastip" data-tip="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Este indicador conta tudo que NÃO é Atrasada. Tarefas sem prazo no Bitrix contam como No prazo.">No prazo</div><div class="v">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"}</div></div>
       </div></div>`;
   }
 
@@ -1138,7 +1165,7 @@ function renderPersonCards(box, rows, opts){
       <div class="mgrid">
         <div><div class="k">Quantidade</div><div class="v">${nf.format(s.n)}</div></div>
         <div><div class="k">${opts.tempoLabel||"Tempo"}</div><div class="v">${fmtDur(s.avgExec)}</div></div>
-        <div><div class="k hastip" data-tip="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Este indicador conta tudo que NÃO é Atrasada.">No prazo</div><div class="v" style="color:${pc}">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"}</div></div>
+        <div><div class="k hastip" data-tip="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Este indicador conta tudo que NÃO é Atrasada. Tarefas sem prazo no Bitrix contam como No prazo.">No prazo</div><div class="v" style="color:${pc}">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"}</div></div>
       </div></div>`;
   }).join("");
   bindTips(box);
@@ -1192,15 +1219,18 @@ function renderLog(list){
     COLS.map(c=>`<th class="${c.right?"right":""}" data-k="${c.k}">${c.t}${sortKey===c.k?(sortDir>0?" ▲":" ▼"):""}</th>`).join("")
   }</tr></thead><tbody>${shown.map(t=>{
     const j=(t.justificativa||"").trim();
+    const jTip=j||(t.aguardandoJust?"O avaliador ainda não enviou a justificativa.":"");
     const aval=!t.rated?`<span class="pill good">Não avaliada</span>`
       :t.sat?`<span class="pill good">Satisfeito</span>`
-      :`<span class="pill bad ${j?"hastip":""}"${j?` data-tip="${esc(j)}"`:""}>Insatisfeito</span>`;
-    const [sc,sl]=t.sla?SLA_LABEL[t.sla]:["none","sem prazo"];
-    const slaTip = t.sla
+      :`<span class="pill bad ${jTip?"hastip":""}"${jTip?` data-tip="${esc(jTip)}"`:""}>Insatisfeito</span>`;
+    const [sc,sl]=t.sla?SLA_LABEL[t.sla]:["none","sem dados"];
+    const slaTip = t.semPrazo
+      ? "Tarefa sem prazo cadastrado no Bitrix — contada como No prazo."
+      : t.sla
       ? (t.slaPct!=null
           ? `${Math.round(t.slaPct)}% do prazo consumido — criada ${fmtParts(t.criado).date} ${fmtParts(t.criado).time}, prazo ${fmtParts(t.deadline).date} ${fmtParts(t.deadline).time}, concluída ${fmtParts(t.conclusao).date} ${fmtParts(t.conclusao).time}. Faixas: até 30% Rápida · 31–90% Normal · 91–100% No prazo · acima de 100% Atrasada.`
           : `Prazo já vencido no momento da criação — concluída ${t.conclusao<=t.deadline?"dentro":"depois"} do prazo final.`)
-      : "Esta tarefa não tem prazo (DEADLINE) cadastrado no Bitrix.";
+      : "Não foi possível consultar esta tarefa no Bitrix (excluída, sem acesso ou falha na consulta), então ela fica fora do indicador de prazo.";
     const dp=fmtParts(t.conclusao);
     return `<tr>
       <td><div class="tk">${esc(t.tarefa||"(sem título)")}<small>#${esc(t.idTarefa||"—")}</small></div></td>
@@ -1210,7 +1240,7 @@ function renderLog(list){
       <td>${aval}</td>
       <td><span class="pill ${sc} hastip" data-tip="${esc(slaTip)}">${sl}</span></td>
       <td class="right">${fmtDur(t.execMs)}</td>
-      <td class="right"><div class="dt"><span class="d">${dp.date}</span><span class="h">${dp.time}</span></div></td>
+      <td class="right"><div class="dt"${t.conclusaoBitrix?"":` data-tip="Sem data de conclusão no Bitrix (tarefa reaberta, excluída ou não consultada) — mostrando a data de envio da avaliação."`}><span class="d">${dp.date}</span><span class="h">${dp.time}${t.conclusaoBitrix?"":" (envio)"}</span></div></td>
     </tr>`;
   }).join("")}</tbody></table>${
     arr.length>shown.length
@@ -1271,7 +1301,7 @@ function exportCsv(){
   const cell=v=>{ const s=(v==null?"":String(v)).replace(/"/g,'""'); return /[";\n]/.test(s)?`"${s}"`:s; };
   const body=rows.map(t=>[t.idTarefa,t.tarefa,t.setorNome,t.responsavel,t.cargo,t.criador,
     !t.rated?"Não avaliada":(t.sat?"Satisfeito":"Insatisfeito"), t.justificativa||"",
-    t.sla?{rapida:"Rápida",normal:"Normal",no_prazo:"No prazo",atrasada:"Atrasada"}[t.sla]:"Sem prazo",
+    t.sla?{rapida:"Rápida",normal:"Normal",no_prazo:"No prazo",atrasada:"Atrasada"}[t.sla]:"Sem dados do Bitrix",
     fmtDur(t.execMs),
     t.conclusao?t.conclusao.toLocaleString("pt-BR"):"",
     t.dataResposta?t.dataResposta.toLocaleString("pt-BR"):""].map(cell).join(";"));
@@ -1336,6 +1366,8 @@ function loadPrefs(){
     sortKey=p.sortKey||sortKey; sortDir=p.sortDir||sortDir;
     el("fRating").value=p.rating||""; el("fSLA").value=p.sla||""; el("fSearch").value=p.q||"";
     activeEntity=p.entity||null;
+    // chave de setor da versão anterior (por nome, "n:...") não existe mais
+    if(activeEntity&&String(activeEntity).startsWith("n:")) activeEntity=null;
     document.querySelectorAll("#viewSeg button").forEach(b=>b.classList.toggle("on",b.dataset.view===view));
     document.querySelectorAll("#periodSeg button").forEach(b=>b.classList.toggle("on",
       period==="custom" ? b.dataset.p==="custom" : +b.dataset.p===period));
@@ -1382,7 +1414,7 @@ async function boot(){
   if(!bitrixOK){
     try{
       const [d,u]=await Promise.all([fetchDepts(),fetchUsers()]);
-      DEPTS=d; buildNameKeyDisplay(); USERS=u; buildIndex(); bitrixOK=true; invalidate();
+      DEPTS=d; buildDeptLabels(); USERS=u; buildIndex(); bitrixOK=true; invalidate();
       el("dotBitrix").className="dot";
     }catch(e){
       bitrixOK=false; el("dotBitrix").className="dot bad";
@@ -1399,10 +1431,12 @@ async function boot(){
     const ids=RAW.filter(r=>INCLUDED_STATUSES.includes(norm(r.status))).map(r=>r.id_tarefa).filter(Boolean);
     const novos=await fetchTaskMeta(ids);
     if(Object.keys(novos).length){ Object.assign(TASK_META,novos); invalidate(); }
-    const semPrazo=prepare().filter(t=>!t.deadline).length;
+    const prep=prepare();
+    const semPrazo=prep.filter(t=>t.semPrazo).length, semDados=prep.filter(t=>!t.sla).length;
     el("syncTxt").textContent=`atualizado às ${new Date().toLocaleTimeString("pt-BR")} · `
       +`${nf.format(Object.keys(USERS).length)} pessoas · ${nf.format(Object.keys(DEPTS).length)} setores`
-      +(semPrazo?` · ${nf.format(semPrazo)} sem prazo no Bitrix`:"");
+      +(semPrazo?` · ${nf.format(semPrazo)} sem prazo no Bitrix (contam no prazo)`:"")
+      +(semDados?` · ${nf.format(semDados)} sem dados do Bitrix`:"");
   }
   clearFatal();
   render();
