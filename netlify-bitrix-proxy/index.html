@@ -126,6 +126,10 @@ button{font-family:inherit}
   padding:4px 8px 4px 12px;font-size:11.5px;color:var(--brand);font-weight:600}
 .chip button{background:none;border:0;color:inherit;cursor:pointer;font-size:14px;opacity:.6;padding:0 2px;line-height:1}
 .chip button:hover{opacity:1}
+/* "Limpar tudo" ao lado dos filtros ativos (antes ficava com o visual padrão do navegador) */
+.chipbar .ghost{background:none;border:1px dashed var(--ink-faint);color:var(--ink-soft);border-radius:20px;
+  padding:3px 11px;font-size:11.5px;cursor:pointer;font-weight:600}
+.chipbar .ghost:hover{border-style:solid;color:var(--brand)}
 
 .panel{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);margin-bottom:16px}
 .panel-hd{display:flex;align-items:center;gap:10px;padding:15px 20px;border-bottom:1px solid var(--line);flex-wrap:wrap}
@@ -152,6 +156,9 @@ button{font-family:inherit}
 .breadcrumb .crumb:last-child:hover{background:none}
 .breadcrumb .sep{color:var(--ink-faint);font-size:12px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(276px,1fr));gap:12px}
+/* título "Lotados direto em …" entre os cartões de setor e os de pessoa */
+.grid-sep{grid-column:1/-1;font-size:10.5px;color:var(--ink-faint);text-transform:uppercase;
+  letter-spacing:.06em;font-weight:700;margin-top:6px}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 .fade-in{animation:fadeIn .1s ease}
 .colab-row{display:flex;align-items:center;gap:12px;padding:9px 14px;border:1px solid var(--line);border-radius:10px;margin-bottom:6px;cursor:pointer;background:#fff;transition:.12s}
@@ -378,18 +385,23 @@ table.log td.right{color:var(--ink-soft);white-space:nowrap}
 const SUPABASE_URL="https://wtuurupfuldzozuxvhml.supabase.co";
 const SUPABASE_ANON_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind0dXVydXBmdWxkem96dXh2aG1sIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ4MzQ1MzcsImV4cCI6MjEwMDQxMDUzN30.nR87TyXZUjpeyfRuOZeyRxKVQ63amapFxyNuvSnE8oI";
 const TABLE="avaliacoes_tarefas";
-const BITRIX_URL="https://gcm.bitrix24.com.br/rest/935/7ie7vmhsgev5e32p/";
+/* A página fala com o Bitrix só pelo proxy. O endereço do webhook (com o
+   token) fica apenas na variável BITRIX_WEBHOOK_URL da Netlify: não escreva
+   esse endereço aqui, porque o código desta página é público. */
 const BITRIX_PROXY_URL="https://testecentral.netlify.app/.netlify/functions/bitrix-proxy";
 const DONE_STATUS="respondido";
 const PENDING_STATUS="pendente";
 const WAITING_STATUS="aguardando_justificativa";
-/* status considerados no painel: respondido (avaliação recebida),
-   pendente (avaliação ainda não respondida — tratada como "Não avaliada"
-   e contada junto com as satisfeitas, ver prepare()) e
-   aguardando_justificativa (a nota já veio, só falta o motivo — conta com
-   a nota dada; sem isso, um Insatisfeito sumia do painel até o avaliador
-   escrever a justificativa) */
+/* status considerados no painel:
+   - respondido: avaliação recebida;
+   - pendente: avaliação ainda não respondida, tratada como "Não avaliada" e
+     contada junto com as satisfeitas (ver prepare());
+   - aguardando_justificativa: a nota já veio e só falta o motivo; conta com a
+     nota dada (sem isso, um Insatisfeito sumia do painel até o avaliador
+     escrever a justificativa). */
 const INCLUDED_STATUSES=[DONE_STATUS,PENDING_STATUS,WAITING_STATUS];
+/* se a mesma tarefa tiver mais de uma linha, vale a de status mais adiantado */
+const STATUS_RANK={[DONE_STATUS]:3,[WAITING_STATUS]:2,[PENDING_STATUS]:1};
 /* só as colunas usadas — evita trafegar a tabela inteira */
 const COLUMNS=["id","id_tarefa","tarefa","proprietario_nome","responsavel_nome","nome_respondente",
                "status","avaliacao","justificativa","data_envio","data_resposta"].join(",");
@@ -397,11 +409,17 @@ const COLUMNS=["id","id_tarefa","tarefa","proprietario_nome","responsavel_nome",
 /* ═════════ ESTADO ═════════ */
 let RAW=[],DEPTS={},USERS={},TASK_META={};
 let PREPARED=null;               /* cache de prepare() */
+let PESSOA_LABEL={};             /* chave do colaborador → nome exibido */
+let DUP_COUNT=0,ESCALA_ANTIGA=0; /* avisos calculados em prepare() */
 let metaFetched=new Set();       /* tarefas cujo prazo já foi buscado */
+let lastRecentRefresh=0;         /* última reconsulta das tarefas recentes */
 let bitrixOK=false;
+let booting=false;               /* impede duas atualizações ao mesmo tempo */
+let lastOkAt=null;               /* hora da última leitura do Supabase que deu certo */
 let view="setor",period=7;
-let trendGran="dia"; // dia|mes|ano — usado em "Tudo" e "Personalizado"
-let customStart=null, customEnd=null; // usados quando period==="custom"
+let trendGran=null; // dia|mes|ano escolhido no gráfico; null = automático ("Tudo" e "Personalizado")
+let customStart=null, customEnd=null; // intervalo do "Personalizado" — só muda no Aplicar
+let customOpen=false; // seletor de datas aberto, antes de aplicar
 let leafPersonFilter=null; // pessoa selecionada num cartão de "folha" dentro da visão Por setor
 let activeEntity=null;
 let sortKey="conclusao",sortDir=-1;
@@ -444,6 +462,30 @@ function fmtParts(v){
 }
 const localKey=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
 const dateOnly=d=>new Date(d.getFullYear(),d.getMonth(),d.getDate());
+/* menor e maior data de conclusão da lista, num laço (espalhar uma lista
+   grande em Math.min/Math.max estoura em alguns navegadores) */
+function minMaxTime(list){
+  let min=Infinity,max=-Infinity;
+  for(const t of list){
+    const v=t.conclusao?t.conclusao.getTime():NaN;
+    if(!isNaN(v)){ if(v<min) min=v; if(v>max) max=v; }
+  }
+  return min===Infinity?null:{min,max};
+}
+/* nome do período escolhido no topo, para os textos de ajuda */
+function periodLabel(){
+  if(period==="custom") return "Personalizado";
+  return ({0:"Tudo",7:"7 dias",30:"30 dias",90:"90 dias"})[period]||`${period} dias`;
+}
+/* rótulo do intervalo quando o gráfico cobre "Tudo" ou o Personalizado */
+function flexLabel(){
+  if(period==="custom"&&customStart&&customEnd)
+    return `de ${dateOnly(customStart).toLocaleDateString("pt-BR")} até ${dateOnly(customEnd).toLocaleDateString("pt-BR")}`;
+  return "todo o período";
+}
+function tipoAcesso(){
+  try{ return JSON.parse(sessionStorage.getItem("cp_session")||"null")?.tipo||null; }catch(e){ return null; }
+}
 
 /* ═════════ TOOLTIP (no body — nunca é cortado pelo painel) ═════════ */
 const tipEl=el("tip");
@@ -469,7 +511,9 @@ function bindTips(root){
 async function fetchSupabase(){
   const out=[],size=1000; let from=0;
   while(true){
-    const res=await fetch(`${SUPABASE_URL}/rest/v1/${TABLE}?select=${COLUMNS}&order=data_envio.desc.nullslast`,{
+    /* "id" desempata a ordem: sem ele, linhas com a mesma data de envio podem
+       trocar de página entre uma consulta e outra */
+    const res=await fetch(`${SUPABASE_URL}/rest/v1/${TABLE}?select=${COLUMNS}&order=data_envio.desc.nullslast,id.desc`,{
       headers:{apikey:SUPABASE_ANON_KEY,Authorization:`Bearer ${SUPABASE_ANON_KEY}`,
                "Range-Unit":"items",Range:`${from}-${from+size-1}`}});
     if(!res.ok) throw {stage:"supabase",status:res.status,message:(await res.text().catch(()=>"")).slice(0,240)};
@@ -484,9 +528,9 @@ async function fetchSupabase(){
 /* ═════════ BITRIX ═════════ */
 async function bx(method,entries=[]){
   const qs=new URLSearchParams();
-  if(BITRIX_PROXY_URL) qs.append("method",method);
+  qs.append("method",method);
   entries.forEach(([k,v])=>qs.append(k,v));
-  const url=BITRIX_PROXY_URL?`${BITRIX_PROXY_URL}?${qs}`:`${BITRIX_URL}${method}.json${entries.length?"?"+qs:""}`;
+  const url=`${BITRIX_PROXY_URL}?${qs}`;
   let res;
   try{ res=await fetch(url); }catch(e){ throw {stage:"bitrix-cors",method,message:e.message}; }
   if(!res.ok) throw {stage:"bitrix-http",method,status:res.status};
@@ -517,10 +561,12 @@ async function fetchUsers(){
   }
   const m={}; all.forEach(u=>m[u.ID]=u); return m;
 }
-/* lotes em PARALELO (era sequencial) + cache entre refreshes */
-async function fetchTaskMeta(ids){
+/* lotes em PARALELO + cache entre atualizações. forceIds: tarefas já
+   consultadas que devem ser consultadas de novo (as recentes, ver boot()) */
+async function fetchTaskMeta(ids,forceIds=[]){
+  const force=new Set(forceIds.map(String));
   const clean=[...new Set(ids.map(String).filter(x=>x&&x!=="null"&&x!=="undefined"))];
-  const pend=clean.filter(id=>!metaFetched.has(id));
+  const pend=clean.filter(id=>!metaFetched.has(id)||force.has(id));
   if(!pend.length) return {};
   const CHUNK=45,POOL=4,chunks=[];
   for(let i=0;i<pend.length;i+=CHUNK) chunks.push(pend.slice(i,i+CHUNK));
@@ -673,9 +719,40 @@ function classifySLA(created,deadline,done){
 
 /* ═════════ PREPARO (com cache) ═════════
    avaliacao 1 = Satisfeito · 2 = Insatisfeito · vazio = presumido satisfeito */
+/* true se a linha "a" deve ficar no lugar de "b" (mesma tarefa em duas
+   linhas): vale o status mais adiantado; no empate, a respondida por último;
+   se nenhuma foi respondida, a linha mais antiga. */
+function linhaPreferida(a,b){
+  const ra=STATUS_RANK[norm(a.status)]||0, rb=STATUS_RANK[norm(b.status)]||0;
+  if(ra!==rb) return ra>rb;
+  const da=toDate(a.data_resposta), db=toDate(b.data_resposta);
+  if(da&&db&&da.getTime()!==db.getTime()) return da>db;
+  if(da&&!db) return true;
+  if(!da&&db) return false;
+  return Number(a.id)<Number(b.id);
+}
 function prepare(){
   if(PREPARED) return PREPARED;
-  PREPARED=RAW.filter(r=>INCLUDED_STATUSES.includes(norm(r.status))).map(r=>{
+  /* Uma linha por tarefa. O disparo do n8n confere se a tarefa já tem linha
+     e só grava depois de mandar o chat; dois eventos do Bitrix quase juntos
+     podem gerar duas linhas para a mesma tarefa, que contaria em dobro.
+     Linhas sem nº de tarefa ficam todas; a mesma linha lida duas vezes
+     (paginação) conta uma vez só. */
+  const vistas=new Set(), porTarefa=new Map();
+  let dups=0, semId=0;
+  RAW.forEach(r=>{
+    if(!INCLUDED_STATUSES.includes(norm(r.status))) return;
+    if(r.id!=null){ if(vistas.has(r.id)) return; vistas.add(r.id); }
+    const idT=r.id_tarefa==null?"":String(r.id_tarefa).trim();
+    const chave=idT?"t:"+idT:"r:"+(r.id!=null?r.id:"x"+(semId++));
+    const atual=porTarefa.get(chave);
+    if(!atual){ porTarefa.set(chave,r); return; }
+    dups++;
+    if(linhaPreferida(r,atual)) porTarefa.set(chave,r);
+  });
+  DUP_COUNT=dups;
+  let antigas=0;
+  PREPARED=[...porTarefa.values()].map(r=>{
     const meta=TASK_META[String(r.id_tarefa)];
     // Prioridade 1: ID do responsável direto da tarefa no Bitrix — imune a
     // qualquer anotação/erro de digitação no nome gravado no Supabase.
@@ -685,8 +762,12 @@ function prepare(){
     let viaId = !!u;
     if(!u) u = findUser(r.responsavel_nome);
     const s=sectorOf(u);
-    const nomeResp = u ? `${u.NAME} ${u.LAST_NAME}`.trim() : cleanName(r.responsavel_nome);
+    const nomeResp = u ? `${u.NAME||""} ${u.LAST_NAME||""}`.trim() : cleanName(r.responsavel_nome);
+    /* chave do colaborador: o ID do Bitrix quando a pessoa foi localizada
+       (dois colaboradores com o mesmo nome não se misturam); senão, o nome */
+    const pessoaId = u ? "id:"+u.ID : "nome:"+norm(nomeResp);
     const rated=r.avaliacao!=null&&r.avaliacao!=="";
+    if(rated&&Number(r.avaliacao)!==1&&Number(r.avaliacao)!==2) antigas++;
     const dEnv=toDate(r.data_envio),dRes=toDate(r.data_resposta);
     /* Conclusão = data de conclusão da tarefa no Bitrix (CLOSED_DATE). Se a
        tarefa não tiver essa data (reaberta, excluída, sem acesso ou Bitrix
@@ -703,7 +784,7 @@ function prepare(){
       :deadline?classifySLA(created||conclusao,deadline,conclusao):null;
     return {
       idTarefa:r.id_tarefa, tarefa:r.tarefa,
-      criador:r.proprietario_nome, responsavel:nomeResp, respondente:r.nome_respondente,
+      criador:r.proprietario_nome, responsavel:nomeResp, pessoaId, respondente:r.nome_respondente,
       justificativa:r.justificativa, aguardandoJust:norm(r.status)===WAITING_STATUS,
       setorId:s.id, setorNome:s.name, deptChain:deptChainIds(s.id), cargo:u?(u.WORK_POSITION||""):"", achado:!!u, achadoViaId:viaId,
       rated, sat: rated?Number(r.avaliacao)===1:true,
@@ -715,7 +796,30 @@ function prepare(){
       slaPct: slaResult?slaResult.pct:null
     };
   });
+  ESCALA_ANTIGA=antigas;
+  buildPessoaLabels(PREPARED);
   return PREPARED;
+}
+/* Rótulo de cada colaborador. Nome único → só o nome. Pessoas diferentes
+   com o mesmo nome → nome + setor; se ainda empatar, entra o ID do Bitrix. */
+function buildPessoaLabels(list){
+  const info=new Map();
+  list.forEach(t=>{ if(!info.has(t.pessoaId)) info.set(t.pessoaId,{nome:t.responsavel||"Sem responsável",setor:t.setorNome}); });
+  const porNome={};
+  info.forEach((v,k)=>{ const n=norm(v.nome); (porNome[n]=porNome[n]||[]).push(k); });
+  PESSOA_LABEL={};
+  Object.values(porNome).forEach(chaves=>{
+    if(chaves.length===1){ PESSOA_LABEL[chaves[0]]=info.get(chaves[0]).nome; return; }
+    const comSetor=chaves.map(k=>({k,label:`${info.get(k).nome} · ${info.get(k).setor}`}));
+    const vezes={};
+    comSetor.forEach(x=>{ const n=norm(x.label); vezes[n]=(vezes[n]||0)+1; });
+    comSetor.forEach(x=>{
+      PESSOA_LABEL[x.k]=vezes[norm(x.label)]>1
+        ?`${x.label} (${x.k.startsWith("id:")?"#"+x.k.slice(3):"fora do Bitrix"})`
+        :x.label;
+    });
+  });
+  list.forEach(t=>{ t.pessoaLabel=PESSOA_LABEL[t.pessoaId]||t.responsavel||"Sem responsável"; });
 }
 const invalidate=()=>{PREPARED=null;};
 
@@ -759,6 +863,14 @@ function windows(){
   return {curStart,curEnd,prevStart,prevEnd};
 }
 const inWin=(t,a,b)=>t.conclusao&&t.conclusao>=a&&t.conclusao<=b;
+/* botão marcado = período que está na tela; o seletor de datas aparece com o
+   Personalizado aplicado ou enquanto a pessoa escolhe as datas */
+function syncPeriodUI(){
+  document.querySelectorAll("#periodSeg button").forEach(b=>{
+    b.classList.toggle("on", b.dataset.p==="custom" ? period==="custom" : +b.dataset.p===period);
+  });
+  el("customRange").style.display=(period==="custom"||customOpen)?"flex":"none";
+}
 
 /* ═════════ FILTROS ═════════ */
 function readFilters(){
@@ -781,9 +893,9 @@ function applyFilters(list){
   return list.filter(t=>{
     if(f.entity){
       if(view==="setor"){ if(!t.deptChain.includes(f.entity)) return false; }
-      else if(t.responsavel!==f.entity) return false;
+      else if(t.pessoaId!==f.entity) return false;
     }
-    if(view==="setor" && leafPersonFilter && t.responsavel!==leafPersonFilter) return false;
+    if(view==="setor" && leafPersonFilter && t.pessoaId!==leafPersonFilter) return false;
     return matchesOtherFilters(t,f);
   });
 }
@@ -838,13 +950,29 @@ function renderKPIs(cur,prev){
 }
 
 /* ═════════ TENDÊNCIA ═════════ */
+/* Em "Tudo" e "Personalizado" dá para ver por dia, mês ou ano. Sem escolha da
+   pessoa, o gráfico abre por dia até 90 dias e por mês acima disso: com
+   centenas de colunas diárias as barras ficam finas demais para ler. */
+function effectiveGran(list){
+  if(trendGran) return trendGran;
+  let dias;
+  if(period==="custom"&&customStart&&customEnd){
+    dias=Math.round((dateOnly(customEnd)-dateOnly(customStart))/86400000)+1;
+  }else{
+    const mm=minMaxTime(list);
+    if(!mm) return "dia";
+    dias=Math.round((dateOnly(new Date(mm.max))-dateOnly(new Date(mm.min)))/86400000)+1;
+  }
+  return dias>90?"mes":"dia";
+}
 function renderTrend(list){
   const seg=el("trendGranSeg");
   const flexible = !period || period==="custom";
+  const gran = flexible ? effectiveGran(list) : "dia";
   seg.style.display = flexible ? "flex" : "none";
-  seg.querySelectorAll("button").forEach(b=>b.classList.toggle("on", b.dataset.g===trendGran));
-  if(flexible && trendGran==="mes") return renderTrendMensal(list);
-  if(flexible && trendGran==="ano") return renderTrendAnual(list);
+  seg.querySelectorAll("button").forEach(b=>b.classList.toggle("on", b.dataset.g===gran));
+  if(gran==="mes") return renderTrendMensal(list);
+  if(gran==="ano") return renderTrendAnual(list);
   return renderTrendDiario(list);
 }
 function renderTrendDiario(list){
@@ -857,10 +985,10 @@ function renderTrendDiario(list){
     startD=dateOnly(customStart); endD=dateOnly(customEnd);
     label=`de ${startD.toLocaleDateString("pt-BR")} até ${endD.toLocaleDateString("pt-BR")}`;
   }else{
-    // "Tudo" (ou personalizado ainda sem datas): abrange do dia mais antigo ao mais novo nos dados
-    const datas=list.map(t=>t.conclusao).filter(Boolean);
-    if(!datas.length){ startD=endD=dateOnly(new Date()); }
-    else{ startD=dateOnly(new Date(Math.min(...datas))); endD=dateOnly(new Date(Math.max(...datas))); }
+    // "Tudo": abrange do dia mais antigo ao mais novo nos dados
+    const mm=minMaxTime(list);
+    if(!mm){ startD=endD=dateOnly(new Date()); }
+    else{ startD=dateOnly(new Date(mm.min)); endD=dateOnly(new Date(mm.max)); }
     label="todo o período";
   }
   const days=Math.max(1, Math.round((endD-startD)/86400000)+1);
@@ -877,7 +1005,7 @@ function renderTrendDiario(list){
     if(!b){ fora++; return; }
     if(t.sat) b.sat++; else b.insat++;
   });
-  const peak=Math.max(1,...buckets.map(b=>b.sat+b.insat));
+  const peak=buckets.reduce((m,b)=>Math.max(m,b.sat+b.insat),1);
   el("trendHint").textContent=`${label} · ${days} dia(s) · pico de ${peak} no dia`+(fora?` · ${nf.format(fora)} fora da janela`:"");
   const every=buckets.length<=31?1:Math.ceil(buckets.length/12);
   el("trend").innerHTML=buckets.map((b,i)=>{
@@ -894,10 +1022,10 @@ function renderTrendDiario(list){
   bindTips(el("trend"));
 }
 function renderTrendMensal(list){
-  const datas=list.map(t=>t.conclusao).filter(Boolean);
+  const mm=minMaxTime(list);
   const map={};
-  if(datas.length){
-    const min=new Date(Math.min(...datas)), max=new Date(Math.max(...datas));
+  if(mm){
+    const min=new Date(mm.min), max=new Date(mm.max);
     let cur=new Date(min.getFullYear(),min.getMonth(),1);
     const last=new Date(max.getFullYear(),max.getMonth(),1);
     while(cur<=last){
@@ -915,8 +1043,8 @@ function renderTrendMensal(list){
     if(t.sat) b.sat++; else b.insat++;
   });
   const buckets=Object.values(map).sort((a,b)=>a.key.localeCompare(b.key));
-  const peak=Math.max(1,...buckets.map(b=>b.sat+b.insat));
-  el("trendHint").textContent=`todo o período · ${buckets.length} mês(es) · pico de ${peak} no mês`+(fora?` · ${nf.format(fora)} fora da janela`:"");
+  const peak=buckets.reduce((m,b)=>Math.max(m,b.sat+b.insat),1);
+  el("trendHint").textContent=`${flexLabel()} · ${buckets.length} mês(es) · pico de ${peak} no mês`+(fora?` · ${nf.format(fora)} fora da janela`:"");
   const MESES=["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"];
   const every=buckets.length<=24?1:Math.ceil(buckets.length/12);
   el("trend").innerHTML=buckets.map((b,i)=>{
@@ -934,7 +1062,6 @@ function renderTrendMensal(list){
 }
 function renderTrendAnual(list){
   const map={};
-  let fora=0;
   list.forEach(t=>{
     if(!t.conclusao){ return; }
     const y=t.conclusao.getFullYear();
@@ -942,8 +1069,8 @@ function renderTrendAnual(list){
     if(t.sat) map[y].sat++; else map[y].insat++;
   });
   const buckets=Object.values(map).sort((a,b)=>a.year-b.year);
-  const peak=Math.max(1,...buckets.map(b=>b.sat+b.insat));
-  el("trendHint").textContent=`todo o período · ${buckets.length} ano(s) · pico de ${peak} no ano`;
+  const peak=buckets.reduce((m,b)=>Math.max(m,b.sat+b.insat),1);
+  el("trendHint").textContent=`${flexLabel()} · ${buckets.length} ano(s) · pico de ${peak} no ano`;
   el("trend").innerHTML=buckets.map(b=>{
     const tot=b.sat+b.insat, h=v=>v?Math.max(3,(v/peak)*56):0;
     const det=tot?`: ${b.sat} satisfeita(s), ${b.insat} insatisfeita(s)`:"";
@@ -959,6 +1086,7 @@ function renderTrendAnual(list){
 }
 
 /* ═════════ GRADE ═════════ */
+const TIP_NO_PRAZO="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Este indicador conta tudo que NÃO é Atrasada. Tarefas sem prazo no Bitrix contam como No prazo.";
 function ringSvg(pct){
   if(pct==null) return `<svg class="ring" width="42" height="42" viewBox="0 0 42 42" aria-hidden="true">
     <circle cx="21" cy="21" r="16" fill="none" stroke="#EEF1F8" stroke-width="4"/>
@@ -976,7 +1104,7 @@ function renderGrid(list){
   renderSectorHierarchy(list);
 }
 
-/* ---- visão "Por colaborador": inalterada, lista plana clicável ---- */
+/* ---- visão "Por colaborador": lista plana clicável, uma linha por pessoa ---- */
 let colabQuery="";
 function renderColabGrid(list){
   el("breadcrumb").innerHTML="";
@@ -994,8 +1122,8 @@ function renderColabGrid(list){
 function renderColabList(list){
   const g=new Map();
   list.forEach(t=>{
-    const key=t.responsavel||"Sem responsável";
-    if(!g.has(key)) g.set(key,{label:key,items:[]});
+    const key=t.pessoaId;
+    if(!g.has(key)) g.set(key,{label:t.pessoaLabel,items:[]});
     g.get(key).items.push(t);
   });
   let rows=[...g.entries()].sort((a,b)=>b[1].items.length-a[1].items.length);
@@ -1019,7 +1147,7 @@ function renderColabList(list){
       <div class="nm" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600">${esc(grp.label)}${fora?` <span class="flag">fora do organograma</span>`:""}</div>
       <div class="colab-mini">${s.n} tarefa(s)</div>
       <div class="colab-mini">${fmtDur(s.avgExec)}</div>
-      <div class="colab-mini hastip" style="color:${pc}" data-tip="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Este indicador conta tudo que NÃO é Atrasada. Tarefas sem prazo no Bitrix contam como No prazo.">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"} no prazo</div>
+      <div class="colab-mini hastip" style="color:${pc}" data-tip="${esc(TIP_NO_PRAZO)}">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"} no prazo</div>
       <div class="colab-mini" style="font-weight:700">${s.satPct==null?"—":Math.round(s.satPct)+"%"} satisf.</div>
     </div>`;
   }).join("");
@@ -1079,25 +1207,28 @@ function renderSectorHierarchy(list){
 
   if(!rows.length){
     // nó-folha: não há mais subdepartamentos com tarefas — mostra as pessoas
-    const pessoas=new Set(list.map(t=>t.responsavel||"—")).size;
+    const pessoas=new Set(list.map(t=>t.pessoaId)).size;
     el("gridHint").textContent = list.length ? `${pessoas} colaborador(es) neste setor` : "nenhum registro";
     if(!list.length){
-      const dica = period ? ` Experimente trocar o período no topo (atualmente "${{7:"7 dias",30:"30 dias",90:"90 dias"}[period]}") para "Tudo" — este setor pode só ter tarefas concluídas fora dessa janela.` : "";
+      const dica = period ? ` Experimente trocar o período no topo (atualmente "${periodLabel()}") para "Tudo" — este setor pode só ter tarefas concluídas fora dessa janela.` : "";
       box.innerHTML=`<div class="thin">Nenhuma tarefa neste setor com os filtros atuais.${dica}</div>`;
       return;
     }
     const g=new Map();
-    list.forEach(t=>{ const k=t.responsavel||"Sem responsável"; if(!g.has(k)) g.set(k,{label:k,items:[]}); g.get(k).items.push(t); });
+    list.forEach(t=>{ const k=t.pessoaId; if(!g.has(k)) g.set(k,{label:t.pessoaLabel,items:[]}); g.get(k).items.push(t); });
     renderPersonCards(box, [...g.entries()].sort((a,b)=>b[1].items.length-a[1].items.length), {clickable:false, tempoLabel:"Tempo"});
     fadeIn(box);
     return;
   }
 
-  el("gridHint").textContent = `${rows.length} setor(es) · clique para navegar`+(directItems.length?` · ${directItems.length} tarefa(s) direto neste nível`:"");
+  /* pessoas lotadas no próprio setor, fora dos subsetores */
+  const diretos=new Map();
+  directItems.forEach(t=>{ const k=t.pessoaId; if(!diretos.has(k)) diretos.set(k,{label:t.pessoaLabel,items:[]}); diretos.get(k).items.push(t); });
+  el("gridHint").textContent = `${rows.length} setor(es) · clique para navegar`+(diretos.size?` · ${diretos.size} pessoa(s) lotada(s) direto neste setor`:"");
   box.innerHTML = rows.map(([key,grp])=>{
     const s=stats(grp.items);
     const pc=s.noPrazoPct==null?"#9AA0B4":s.noPrazoPct>=85?"#00973A":s.noPrazoPct>=60?"#BA560B":"#DE001A";
-    return `<div class="entity" data-key="${esc(key)}" tabindex="0" role="button">
+    return `<div class="entity" data-setor="${esc(key)}" tabindex="0" role="button">
       <div class="entity-hd">
         <div class="avatar">${esc(initials(grp.nome||grp.label))}</div>
         <div style="min-width:0;flex:1">
@@ -1109,31 +1240,21 @@ function renderSectorHierarchy(list){
       <div class="mgrid">
         <div><div class="k">Quantidade</div><div class="v">${nf.format(s.n)}</div></div>
         <div><div class="k">Tempo</div><div class="v">${fmtDur(s.avgExec)}</div></div>
-        <div><div class="k hastip" data-tip="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Este indicador conta tudo que NÃO é Atrasada. Tarefas sem prazo no Bitrix contam como No prazo.">No prazo</div><div class="v" style="color:${pc}">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"}</div></div>
+        <div><div class="k hastip" data-tip="${esc(TIP_NO_PRAZO)}">No prazo</div><div class="v" style="color:${pc}">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"}</div></div>
       </div></div>`;
   }).join("");
 
-  if(directItems.length){
-    const s=stats(directItems);
-    box.innerHTML += `<div class="entity" style="cursor:default">
-      <div class="entity-hd">
-        <div class="avatar">👤</div>
-        <div style="min-width:0;flex:1">
-          <div class="nm">Equipe direta deste setor</div>
-          <div class="sub">${s.n} tarefa(s) · lotados aqui, sem sub-dpto</div>
-        </div>
-        ${ringSvg(s.satPct)}
-      </div>
-      <div class="mgrid">
-        <div><div class="k">Quantidade</div><div class="v">${nf.format(s.n)}</div></div>
-        <div><div class="k">Tempo</div><div class="v">${fmtDur(s.avgExec)}</div></div>
-        <div><div class="k hastip" data-tip="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Este indicador conta tudo que NÃO é Atrasada. Tarefas sem prazo no Bitrix contam como No prazo.">No prazo</div><div class="v">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"}</div></div>
-      </div></div>`;
+  /* quem está lotado no próprio setor aparece com o nome, um cartão por
+     pessoa, como na última camada da árvore (antes era um cartão só,
+     "Equipe direta deste setor", sem os nomes) */
+  if(diretos.size){
+    box.innerHTML += `<div class="grid-sep">Lotados direto em ${esc(deptName(activeEntity))}</div>`
+      + personCardsHtml([...diretos.entries()].sort((a,b)=>b[1].items.length-a[1].items.length), {clickable:false, tempoLabel:"Tempo"});
   }
 
-  box.querySelectorAll(".entity[data-key]").forEach(card=>{
+  box.querySelectorAll(".entity[data-setor]").forEach(card=>{
     const act=()=>{
-      activeEntity=card.dataset.key;               // navegar sempre entra (não é toggle)
+      activeEntity=card.dataset.setor;             // navegar sempre entra (não é toggle)
       leafPersonFilter=null;
       el("fEntity").value=activeEntity||"";
       rowLimit=100; render();
@@ -1144,10 +1265,10 @@ function renderSectorHierarchy(list){
   bindTips(box);
   fadeIn(box);
 }
-/* ---- cartão de pessoa reutilizável (colaborador flat e folha do setor) ---- */
-function renderPersonCards(box, rows, opts){
-  if(!rows.length){ box.innerHTML=`<div class="thin">Nenhum registro no filtro atual.</div>`; return; }
-  box.innerHTML = rows.map(([key,grp])=>{
+/* ---- cartão de pessoa reutilizável (última camada da árvore e lotados
+   direto num setor que também tem subsetores) ---- */
+function personCardsHtml(rows, opts){
+  return rows.map(([key,grp])=>{
     const s=stats(grp.items), t0=grp.items[0];
     const fora=!t0.achado;
     const pc=s.noPrazoPct==null?"#9AA0B4":s.noPrazoPct>=85?"#00973A":s.noPrazoPct>=60?"#BA560B":"#DE001A";
@@ -1165,9 +1286,13 @@ function renderPersonCards(box, rows, opts){
       <div class="mgrid">
         <div><div class="k">Quantidade</div><div class="v">${nf.format(s.n)}</div></div>
         <div><div class="k">${opts.tempoLabel||"Tempo"}</div><div class="v">${fmtDur(s.avgExec)}</div></div>
-        <div><div class="k hastip" data-tip="Classificação pelo % do prazo consumido até a conclusão: até 30% do tempo = Rápida · 31% a 90% = Normal · 91% a 100% = No prazo · acima de 100% (passou do prazo) = Atrasada. Este indicador conta tudo que NÃO é Atrasada. Tarefas sem prazo no Bitrix contam como No prazo.">No prazo</div><div class="v" style="color:${pc}">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"}</div></div>
+        <div><div class="k hastip" data-tip="${esc(TIP_NO_PRAZO)}">No prazo</div><div class="v" style="color:${pc}">${s.noPrazoPct==null?"—":Math.round(s.noPrazoPct)+"%"}</div></div>
       </div></div>`;
   }).join("");
+}
+function renderPersonCards(box, rows, opts){
+  if(!rows.length){ box.innerHTML=`<div class="thin">Nenhum registro no filtro atual.</div>`; return; }
+  box.innerHTML = personCardsHtml(rows, opts);
   bindTips(box);
   if(!opts.clickable) return;
   box.querySelectorAll(".entity").forEach(card=>{
@@ -1211,7 +1336,7 @@ function renderLog(list){
     :"nenhum registro";
   const wrap=el("logWrap");
   if(!arr.length){
-    const dica = period ? ` Experimente trocar o período no topo (atualmente "${({7:"7 dias",30:"30 dias",90:"90 dias"})[period]}") para "Tudo".` : "";
+    const dica = period ? ` Experimente trocar o período no topo (atualmente "${periodLabel()}") para "Tudo".` : "";
     wrap.innerHTML=`<div class="thin">Nenhuma tarefa concluída corresponde aos filtros atuais.${dica}</div>`;
     return;
   }
@@ -1258,17 +1383,25 @@ function renderLog(list){
 
 /* ═════════ CHIPS / SELECT ═════════ */
 function fillEntitySelect(all){
-  const sel=el("fEntity"),keep=sel.value;
-  const opts=view==="setor"
-    ?[...new Map(all.map(t=>[t.setorId,t.setorNome]))].sort((a,b)=>a[1].localeCompare(b[1],"pt-BR"))
-    :[...new Set(all.map(t=>t.responsavel).filter(Boolean))].sort((a,b)=>a.localeCompare(b,"pt-BR")).map(n=>[n,n]);
+  const sel=el("fEntity");
+  let opts;
+  if(view==="setor"){
+    /* todos os setores que aparecem no caminho de alguma tarefa, inclusive os
+       setores-pai, para o seletor acompanhar a navegação pelos cartões */
+    const ids=new Set();
+    all.forEach(t=>t.deptChain.forEach(id=>ids.add(id)));
+    opts=[...ids].map(id=>[id,deptLabel(id)]);
+  }else{
+    opts=[...new Map(all.map(t=>[t.pessoaId,t.pessoaLabel]))];
+  }
+  opts.sort((a,b)=>String(a[1]).localeCompare(String(b[1]),"pt-BR"));
   sel.innerHTML=`<option value="">Todos</option>`+opts.map(([v,l])=>`<option value="${esc(v)}">${esc(l)}</option>`).join("");
-  sel.value=keep;
+  sel.value=activeEntity||"";
 }
 function renderChips(all){
   const f=readFilters(),chips=[];
   if(f.entity){
-    const label = view==="setor" ? deptLabel(f.entity) : f.entity;
+    const label = view==="setor" ? deptLabel(f.entity) : (PESSOA_LABEL[f.entity]||f.entity);
     chips.push({label:(view==="setor"?"Setor":"Colaborador")+": "+label,
       clear:()=>{activeEntity=null;el("fEntity").value="";}});
   }
@@ -1277,7 +1410,7 @@ function renderChips(all){
   if(f.sla) chips.push({label:{rapida:"Prazo: rápidas",normal:"Prazo: normais",no_prazo:"Prazo: no prazo",atrasada:"Prazo: atrasadas",sem:"Sem prazo definido"}[f.sla],
     clear:()=>el("fSLA").value=""});
   if(f.q) chips.push({label:`Busca: "${el("fSearch").value}"`,clear:()=>el("fSearch").value=""});
-  if(leafPersonFilter) chips.push({label:"Colaborador: "+leafPersonFilter, clear:()=>{leafPersonFilter=null;}});
+  if(leafPersonFilter) chips.push({label:"Colaborador: "+(PESSOA_LABEL[leafPersonFilter]||leafPersonFilter), clear:()=>{leafPersonFilter=null;}});
   const bar=el("chipBar");
   if(!chips.length){ bar.innerHTML=""; return; }
   bar.innerHTML=chips.map((c,i)=>`<span class="chip">${esc(c.label)}<button data-i="${i}" aria-label="remover filtro">×</button></span>`).join("")
@@ -1294,13 +1427,22 @@ function currentRows(){
   return f.filter(t=>inWin(t,curStart,curEnd));
 }
 function exportCsv(){
+  if(tipoAcesso()==="individual") return;   /* Básico não exporta (ver aplicarRestricoesDeAcesso) */
   const rows=currentRows();
   if(!rows.length){ alert("Nenhum registro para exportar com os filtros atuais."); return; }
   const head=["Nº Tarefa","Tarefa","Setor","Responsável","Cargo","Criador","Avaliação","Justificativa",
               "Prazo","Tempo de execução","Concluída em","Avaliada em"];
-  const cell=v=>{ const s=(v==null?"":String(v)).replace(/"/g,'""'); return /[";\n]/.test(s)?`"${s}"`:s; };
+  /* texto que começa com = + - @ vira fórmula no Excel e aparece como #NOME?;
+     o apóstrofo na frente faz o Excel tratar como texto */
+  const cell=v=>{
+    let s=v==null?"":String(v);
+    if(/^[=+\-@]/.test(s)) s="'"+s;
+    s=s.replace(/"/g,'""');
+    return /[";\n\r]/.test(s)?`"${s}"`:s;
+  };
   const body=rows.map(t=>[t.idTarefa,t.tarefa,t.setorNome,t.responsavel,t.cargo,t.criador,
-    !t.rated?"Não avaliada":(t.sat?"Satisfeito":"Insatisfeito"), t.justificativa||"",
+    !t.rated?"Não avaliada":(t.sat?"Satisfeito":"Insatisfeito"),
+    t.justificativa||(t.aguardandoJust?"(aguardando justificativa)":""),
     t.sla?{rapida:"Rápida",normal:"Normal",no_prazo:"No prazo",atrasada:"Atrasada"}[t.sla]:"Sem dados do Bitrix",
     fmtDur(t.execMs),
     t.conclusao?t.conclusao.toLocaleString("pt-BR"):"",
@@ -1314,19 +1456,16 @@ function exportCsv(){
 }
 
 /* ═════════ RENDER ═════════ */
+/* Básico não vê a tabela, o período personalizado nem o CSV (que traz a
+   mesma lista da tabela, com responsável e justificativa). */
 function aplicarRestricoesDeAcesso(){
-  try{
-    const s=JSON.parse(sessionStorage.getItem("cp_session")||"null");
-    const btnP=el("btnPersonalizado"), lp=el("logPanel");
-    if(s && s.tipo==="individual"){
-      if(btnP) btnP.style.display="none";
-      if(lp) lp.style.display="none";
-      if(period==="custom") period=7;
-    }else{
-      if(btnP) btnP.style.display="";
-      if(lp) lp.style.display="";
-    }
-  }catch(e){}
+  const basico=tipoAcesso()==="individual";
+  const btnP=el("btnPersonalizado"), lp=el("logPanel"), csv=el("btnCsv");
+  if(btnP) btnP.style.display=basico?"none":"";
+  if(lp) lp.style.display=basico?"none":"";
+  if(csv) csv.style.display=basico?"none":"";
+  if(basico){ customOpen=false; if(period==="custom") period=7; }
+  syncPeriodUI();
 }
 function render(){
   aplicarRestricoesDeAcesso();
@@ -1353,29 +1492,38 @@ function clearFilters(){
 function savePrefs(){
   try{ sessionStorage.setItem("cp_prefs",JSON.stringify({view,period,
     customStart:customStart?customStart.toISOString():null, customEnd:customEnd?customEnd.toISOString():null,
-    entity:el("fEntity").value,rating:el("fRating").value,sla:el("fSLA").value,
-    q:el("fSearch").value,sortKey,sortDir})); }catch(e){}
+    entity:activeEntity||"",rating:el("fRating").value,sla:el("fSLA").value,
+    q:el("fSearch").value,sortKey,sortDir,gran:trendGran})); }catch(e){}
 }
 function loadPrefs(){
   try{
     const p=JSON.parse(sessionStorage.getItem("cp_prefs")||"null");
     if(!p) return;
-    view=p.view||view; period=p.period??period;
+    view=p.view==="colab"?"colab":"setor";
+    period=p.period??period;
     if(p.customStart) customStart=new Date(p.customStart);
     if(p.customEnd) customEnd=new Date(p.customEnd);
+    /* o Personalizado só vale com um intervalo válido; senão volta para 7 dias */
+    const intervaloOk=customStart&&customEnd&&!isNaN(customStart)&&!isNaN(customEnd)&&customStart<=customEnd;
+    if(period==="custom"&&!intervaloOk) period=7;
+    if(period!=="custom"&&![0,7,30,90].includes(period)) period=7;
     sortKey=p.sortKey||sortKey; sortDir=p.sortDir||sortDir;
+    if(["dia","mes","ano"].includes(p.gran)) trendGran=p.gran;
     el("fRating").value=p.rating||""; el("fSLA").value=p.sla||""; el("fSearch").value=p.q||"";
     activeEntity=p.entity||null;
-    // chave de setor da versão anterior (por nome, "n:...") não existe mais
-    if(activeEntity&&String(activeEntity).startsWith("n:")) activeEntity=null;
-    document.querySelectorAll("#viewSeg button").forEach(b=>b.classList.toggle("on",b.dataset.view===view));
-    document.querySelectorAll("#periodSeg button").forEach(b=>b.classList.toggle("on",
-      period==="custom" ? b.dataset.p==="custom" : +b.dataset.p===period));
-    if(period==="custom"){
-      el("customRange").style.display="flex";
-      if(customStart) el("customFrom").value=localKey(customStart);
-      if(customEnd) el("customTo").value=localKey(customEnd);
+    if(activeEntity){
+      const e=String(activeEntity);
+      // chave de setor da versão anterior (por nome, "n:...") não existe mais
+      if(view==="setor"&&e.startsWith("n:")) activeEntity=null;
+      // colaborador era guardado pelo nome; agora a chave é "id:..." ou "nome:..."
+      if(view==="colab"&&!/^(id|nome):/.test(e)) activeEntity=null;
     }
+    document.querySelectorAll("#viewSeg button").forEach(b=>b.classList.toggle("on",b.dataset.view===view));
+    if(period==="custom"){
+      el("customFrom").value=localKey(customStart);
+      el("customTo").value=localKey(customEnd);
+    }
+    syncPeriodUI();
   }catch(e){}
 }
 
@@ -1394,53 +1542,82 @@ function fatal(title,msg){
 }
 
 /* ═════════ BOOT ═════════ */
+/* avisos sobre os dados da tabela, mostrados na barra de status */
+function avisosDados(){
+  return (DUP_COUNT?` · ${nf.format(DUP_COUNT)} linha(s) repetida(s) da mesma tarefa ignorada(s)`:"")
+    +(ESCALA_ANTIGA?` · ⚠ ${nf.format(ESCALA_ANTIGA)} avaliação(ões) com nota diferente de 1 e 2`:"");
+}
 async function boot(){
+  if(booting) return;             /* já tem uma atualização em andamento */
+  booting=true;
   const btn=el("btnSync");
   btn.classList.add("busy");
   el("syncTxt").textContent="sincronizando…";
   try{
-    RAW=await fetchSupabase(); invalidate();
-    el("dotSupa").className="dot";
-  }catch(e){
-    el("dotSupa").className="dot bad";
-    console.error("Supabase:",e);
-    fatal("Não foi possível ler o Supabase",
-      `${esc(e.message||"")}${e.status?` (HTTP ${e.status})`:""}<br><br>
-       Confirme se a tabela <code>${TABLE}</code> existe e se a política de RLS libera <code>SELECT</code> para a role <code>anon</code>.`);
-    btn.classList.remove("busy");
-    return;
-  }
-  /* organograma só uma vez — muda raramente */
-  if(!bitrixOK){
     try{
-      const [d,u]=await Promise.all([fetchDepts(),fetchUsers()]);
-      DEPTS=d; buildDeptLabels(); USERS=u; buildIndex(); bitrixOK=true; invalidate();
-      el("dotBitrix").className="dot";
+      RAW=await fetchSupabase(); invalidate();
+      lastOkAt=new Date();
+      el("dotSupa").className="dot";
     }catch(e){
-      bitrixOK=false; el("dotBitrix").className="dot bad";
-      console.error("Bitrix:",e);
-      el("syncTxt").textContent = e.stage==="bitrix-cors"
-        ? "Bitrix bloqueado (CORS) — agrupando sem setor. Verifique BITRIX_PROXY_URL."
-        : e.stage==="bitrix-api"
-          ? `Bitrix recusou ${e.method}: ${e.message} — verifique os escopos do webhook.`
-          : `Falha ao consultar o Bitrix (${e.method||""}) — agrupando sem setor.`;
+      el("dotSupa").className="dot bad";
+      console.error("Supabase:",e);
+      if(lastOkAt){
+        /* já tem dados na tela: mantém o que está lá e só avisa */
+        el("syncTxt").textContent=`Falha ao ler o Supabase às ${new Date().toLocaleTimeString("pt-BR")}. `
+          +`Mostrando os dados de ${lastOkAt.toLocaleTimeString("pt-BR")}; nova tentativa na próxima atualização.`;
+        return;
+      }
+      el("syncTxt").textContent="Supabase indisponível";
+      fatal("Não foi possível ler o Supabase",
+        `${esc(e.message||"")}${e.status?` (HTTP ${e.status})`:""}<br><br>
+         Confirme se a tabela <code>${TABLE}</code> existe e se a política de RLS libera <code>SELECT</code> para a role <code>anon</code>.`);
+      return;
     }
+    /* organograma só uma vez — muda raramente */
+    if(!bitrixOK){
+      try{
+        const [d,u]=await Promise.all([fetchDepts(),fetchUsers()]);
+        DEPTS=d; buildDeptLabels(); USERS=u; buildIndex(); bitrixOK=true; invalidate();
+        el("dotBitrix").className="dot";
+      }catch(e){
+        bitrixOK=false; el("dotBitrix").className="dot bad";
+        console.error("Bitrix:",e);
+        prepare();
+        el("syncTxt").textContent=(e.stage==="bitrix-cors"
+          ? "Bitrix bloqueado (CORS) — agrupando sem setor. Verifique BITRIX_PROXY_URL."
+          : e.stage==="bitrix-api"
+            ? `Bitrix recusou ${e.method}: ${e.message} — verifique os escopos do webhook.`
+            : `Falha ao consultar o Bitrix (${e.method||""}) — agrupando sem setor.`)+avisosDados();
+      }
+    }
+    /* prazos: só das tarefas ainda não consultadas, mais as recentes */
+    if(bitrixOK){
+      const incl=RAW.filter(r=>INCLUDED_STATUSES.includes(norm(r.status))&&r.id_tarefa);
+      let recentes=[];
+      if(Date.now()-lastRecentRefresh>15*60*1000){
+        /* a conclusão e o prazo podem mudar depois do envio da avaliação
+           (aceite do criador, reabertura), então as tarefas da última semana
+           são consultadas de novo a cada 15 minutos */
+        const limite=Date.now()-7*86400000;
+        recentes=incl.filter(r=>{ const d=toDate(r.data_envio); return d&&d.getTime()>=limite; }).map(r=>r.id_tarefa);
+        lastRecentRefresh=Date.now();
+      }
+      const novos=await fetchTaskMeta(incl.map(r=>r.id_tarefa),recentes);
+      if(Object.keys(novos).length){ Object.assign(TASK_META,novos); invalidate(); }
+      const prep=prepare();
+      const semPrazo=prep.filter(t=>t.semPrazo).length, semDados=prep.filter(t=>!t.sla).length;
+      el("syncTxt").textContent=`atualizado às ${new Date().toLocaleTimeString("pt-BR")} · `
+        +`${nf.format(Object.keys(USERS).length)} pessoas · ${nf.format(Object.keys(DEPTS).length)} setores`
+        +(semPrazo?` · ${nf.format(semPrazo)} sem prazo no Bitrix (contam no prazo)`:"")
+        +(semDados?` · ${nf.format(semDados)} sem dados do Bitrix`:"")
+        +avisosDados();
+    }
+    clearFatal();
+    render();
+  }finally{
+    booting=false;
+    btn.classList.remove("busy");
   }
-  /* prazos: só das tarefas ainda não consultadas */
-  if(bitrixOK){
-    const ids=RAW.filter(r=>INCLUDED_STATUSES.includes(norm(r.status))).map(r=>r.id_tarefa).filter(Boolean);
-    const novos=await fetchTaskMeta(ids);
-    if(Object.keys(novos).length){ Object.assign(TASK_META,novos); invalidate(); }
-    const prep=prepare();
-    const semPrazo=prep.filter(t=>t.semPrazo).length, semDados=prep.filter(t=>!t.sla).length;
-    el("syncTxt").textContent=`atualizado às ${new Date().toLocaleTimeString("pt-BR")} · `
-      +`${nf.format(Object.keys(USERS).length)} pessoas · ${nf.format(Object.keys(DEPTS).length)} setores`
-      +(semPrazo?` · ${nf.format(semPrazo)} sem prazo no Bitrix (contam no prazo)`:"")
-      +(semDados?` · ${nf.format(semDados)} sem dados do Bitrix`:"");
-  }
-  clearFatal();
-  render();
-  btn.classList.remove("busy");
 }
 
 /* ═════════ EVENTOS ═════════ */
@@ -1456,33 +1633,34 @@ document.querySelectorAll("#viewSeg button").forEach(b=>b.addEventListener("clic
   activeEntity=null; leafPersonFilter=null; el("fEntity").value=""; rowLimit=100; render();
 }));
 document.querySelectorAll("#periodSeg button").forEach(b=>b.addEventListener("click",()=>{
-  document.querySelectorAll("#periodSeg button").forEach(x=>x.classList.remove("on"));
-  b.classList.add("on");
   if(b.dataset.p==="custom"){
-    period="custom";
-    el("customRange").style.display="flex";
-    if(!customStart||!customEnd) return; // espera o usuário escolher e clicar em "Aplicar"
-  }else{
-    el("customRange").style.display="none";
-    period=+b.dataset.p;
+    /* só abre o seletor de datas; o período muda de verdade no "Aplicar" */
+    customOpen=true;
+    if(customStart) el("customFrom").value=localKey(customStart);
+    if(customEnd) el("customTo").value=localKey(customEnd);
+    el("customHint").textContent=period==="custom"?"":"Escolha as datas e clique em Aplicar período.";
+    syncPeriodUI();
+    return;
   }
+  customOpen=false;
+  el("customHint").textContent="";
+  period=+b.dataset.p;
   rowLimit=100; render();
 }));
-el("customFrom").addEventListener("change",()=>{ customStart=el("customFrom").value?new Date(el("customFrom").value+"T00:00:00"):null; });
-el("customTo").addEventListener("change",()=>{ customEnd=el("customTo").value?new Date(el("customTo").value+"T00:00:00"):null; });
 el("btnApplyCustom").addEventListener("click",()=>{
   const fromVal=el("customFrom").value, toVal=el("customTo").value;
-  customStart = fromVal ? new Date(fromVal+"T00:00:00") : null;
-  customEnd = toVal ? new Date(toVal+"T00:00:00") : null;
-  if(!customStart||!customEnd){
+  const ini=fromVal?new Date(fromVal+"T00:00:00"):null;
+  const fim=toVal?new Date(toVal+"T00:00:00"):null;
+  if(!ini||!fim||isNaN(ini)||isNaN(fim)){
     el("customHint").textContent="Escolha as duas datas antes de aplicar.";
     return;
   }
-  if(customStart>customEnd){
+  if(ini>fim){
     el("customHint").textContent="A data 'De' precisa ser antes ou igual à data 'Até'.";
     return;
   }
   el("customHint").textContent="";
+  customStart=ini; customEnd=fim; customOpen=false;
   period="custom"; rowLimit=100; render();
 });
 el("trendGranSeg").addEventListener("click",e=>{
@@ -1599,6 +1777,7 @@ function renderPermsFiltrado(){
 }
 
 loadPrefs();
+aplicarRestricoesDeAcesso();
 boot();
 setInterval(boot,5*60*1000);
 </script>
